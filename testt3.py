@@ -8,19 +8,15 @@ from minisom import MiniSom
 from fcmeans import FCM
 
 
+
 # 1. Генерация данных, приближенных к реальным пробам руды
 def generate_ore_data(n_samples=365):
-    """Генерация данных с явными кластерами, но с шумом"""
     np.random.seed(42)
-    # Основные кластеры (соответствуют сортам руды)
-    cluster1 = np.random.normal(loc=[60, 25, 45], scale=[5, 3, 8],
-                                size=(n_samples // 3, 3))  # Высокое Fe, легкоизмельчаемый
-    cluster2 = np.random.normal(loc=[45, 35, 65], scale=[7, 4, 12], size=(n_samples // 3, 3))  # Средний сорт
-    cluster3 = np.random.normal(loc=[70, 40, 30], scale=[6, 5, 10], size=(n_samples // 3, 3))  # Трудноизмельчаемый
-
-    # Добавляем 10% выбросов для реалистичности
-    outliers = np.random.uniform(low=[30, 15, 20], high=[80, 50, 80], size=(n_samples // 10, 3))
-    return np.vstack((cluster1, cluster2, cluster3, outliers))
+    # Реальные параметры руды КМА:
+    cluster1 = np.random.normal(loc=[35, 20, 40], scale=[3, 2, 5], size=(n_samples//3, 3))  # Бедная руда
+    cluster2 = np.random.normal(loc=[45, 30, 55], scale=[4, 3, 7], size=(n_samples//3, 3))  # Средняя
+    cluster3 = np.random.normal(loc=[25, 40, 70], scale=[5, 4, 10], size=(n_samples//3, 3)) # Трудноизмельчаемая
+    return np.vstack((cluster1, cluster2, cluster3))
 
 
 data = generate_ore_data()
@@ -43,19 +39,71 @@ def kmeans_cluster(data, n_clusters):
 
 
 def fuzzy_cmeans(data, n_clusters):
-    fcm = FCM(n_clusters=n_clusters, m=1.7)  # m=1.7 для менее "размытых" кластеров
+    fcm = FCM(n_clusters=n_clusters, m=1.5, max_iter=200, random_state=42)
     fcm.fit(data)
     labels = fcm.predict(data)
     return labels, fcm.centers
 
 
 def kohonen_cluster(data, n_clusters):
-    som = MiniSom(1, n_clusters, data.shape[1], sigma=0.2, learning_rate=0.5, random_seed=42)
-    som.train_random(data, 150)
-    labels = np.array([som.winner(x)[1] for x in data])
-    centers = np.array([som.get_weights()[0, i] for i in range(n_clusters)])
-    return labels, centers
+    # 1. Параметры карты
+    map_size = (int(np.sqrt(5 * n_clusters)), int(np.sqrt(5 * n_clusters)))
 
+    # 2. Инициализация и обучение SOM
+    som = MiniSom(map_size[0], map_size[1], data.shape[1],
+                  sigma=1.5,
+                  learning_rate=0.5,
+                  neighborhood_function='gaussian',
+                  random_seed=42)
+
+    # 3. Инициализация весов (убираем PCA инициализацию, чтобы избежать комплексных чисел)
+    som.random_weights_init(data)
+
+    # 4. Обучение
+    print("Training SOM...")
+    som.train_random(data, 1000, verbose=True)
+
+    # 5. Получаем координаты победителей для всех точек
+    winner_coords = np.array([som.winner(x) for x in data])
+
+    # 6. Кластеризация нейронов
+    weights = som.get_weights().reshape(-1, data.shape[1])
+
+    # Используем K-means для кластеризации нейронов
+    from sklearn.cluster import KMeans
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+    neuron_clusters = kmeans.fit_predict(weights)
+
+    # 7. Назначение меток данным
+    neuron_indices = winner_coords[:, 0] * map_size[1] + winner_coords[:, 1]
+    labels = neuron_clusters[neuron_indices.astype(int)]
+
+    # 8. Вычисление центроидов (с обработкой пустых кластеров)
+    centers = []
+    for i in range(n_clusters):
+        cluster_points = data[labels == i]
+        if len(cluster_points) > 0:
+            centers.append(cluster_points.mean(axis=0))
+        else:
+            # Если кластер пустой, используем случайную точку данных
+            centers.append(data[np.random.randint(0, len(data))])
+    centers = np.array(centers)
+
+    # 9. Визуализация карты с кластерами (исправленная)
+    plt.figure(figsize=(10, 10))
+    plt.pcolor(som.distance_map().T, cmap='bone_r')
+    plt.colorbar()
+
+    # Упрощенная визуализация без маркеров-цифр
+    for i in range(len(data)):
+        x, y = winner_coords[i]
+        plt.scatter(x + 0.5, y + 0.5, color=plt.cm.tab10(labels[i] % 10), s=30)
+
+    plt.title('Карта SOM с кластерами')
+    plt.savefig('som_clusters.png')
+    plt.close()
+
+    return labels, centers
 
 # 5. Скользящее окно с расчетом метрик
 for i in range(0, len(data) - window_size + 1, 10):  # Шаг=10 для ускорения
@@ -146,17 +194,54 @@ print(f"  DB: {results_df['kohonen_db'].mean():.4f}")
 # 8. Сохранение результатов в CSV
 results_df.to_csv('clustering_results.csv', index=False)
 
-# Визуализация кластеров (пример для последнего окна)
-from sklearn.decomposition import PCA
+from mpl_toolkits.mplot3d import Axes3D
 
-pca = PCA(n_components=2)
-reduced_data = pca.fit_transform(scaled_data[-window_size:])
+from sklearn.preprocessing import MinMaxScaler
+scaler = MinMaxScaler(feature_range=(0, 1))  # Нормализуем в диапазон [0,1] для наглядности
+scaled_data = scaler.fit_transform(data)
 
-plt.figure(figsize=(10, 6))
-for method, color, marker in zip(['kmeans', 'fcm', 'kohonen'], ['blue', 'green', 'red'], ['o', 's', '^']):
-    labels = locals()[f"{method}_labels"]
-    plt.scatter(reduced_data[:, 0], reduced_data[:, 1], c=labels, cmap='viridis',
-               marker=marker, alpha=0.6, label=method)
-plt.title('2D проекция кластеров (PCA)')
-plt.legend()
-plt.show()
+
+def plot_3d_clusters(data, labels, title, save_name):
+    fig = plt.figure(figsize=(12, 9))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Используем другой цветовой градиент
+    scatter = ax.scatter(data[:, 0], data[:, 1], data[:, 2],
+                         c=labels, cmap='plasma', s=40, alpha=0.8, edgecolor='k')
+
+    ax.set_xlabel('Содержание железа (α, %)', fontsize=12, labelpad=10)
+    ax.set_ylabel('Трудноизмельчаемые (μ, %)', fontsize=12, labelpad=10)
+    ax.set_zlabel('Крупность (d, мм)', fontsize=12, labelpad=10)
+
+    ax.set_title(title, fontsize=14, pad=20)
+    ax.grid(True)
+
+    # Добавляем цветовую шкалу
+    cbar = plt.colorbar(scatter, pad=0.1)
+    cbar.set_label('Номер кластера', rotation=270, labelpad=15)
+
+    # Устанавливаем угол обзора
+    ax.view_init(elev=25, azim=45)
+
+    plt.tight_layout()
+    plt.savefig(f'{save_name}.png', dpi=200, bbox_inches='tight')
+    plt.show()
+
+
+# Пример использования для последнего окна данных
+window_data = scaled_data[-window_size:]
+
+# Для k-means
+kmeans_labels, _ = kmeans_cluster(window_data, n_clusters)
+plot_3d_clusters(window_data, kmeans_labels,
+                 "3D-визуализация кластеров (k-means)", "kmeans_3d")
+
+# Для fuzzy c-means
+fcm_labels, _ = fuzzy_cmeans(window_data, n_clusters)
+plot_3d_clusters(window_data, fcm_labels,
+                 "3D-визуализация кластеров (fuzzy c-means)", "fcm_3d")
+
+# Для Kohonen
+kohonen_labels, _ = kohonen_cluster(window_data, n_clusters)
+plot_3d_clusters(window_data, kohonen_labels,
+                 "3D-визуализация кластеров (Kohonen)", "kohonen_3d")
